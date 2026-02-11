@@ -1,6 +1,19 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import json
 import math
-import os
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, List, Optional
 
@@ -8,10 +21,10 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh
 
-from tpu_inference import utils
+from tpu_inference import envs, utils
 
 if TYPE_CHECKING:
-    from vllm.v1.configs.vllm_config import VllmConfig
+    from vllm.config import VllmConfig
 
 MESH_AXIS_NAMES = ("data", "attn_dp", "expert", "model")
 MESH_AXIS_NAMES_2D = ('data', 'model')
@@ -22,12 +35,15 @@ class ShardingAxisNameBase:
     SEQUENCE = ('data', 'attn_dp')
     ATTN_DATA = ('data', 'attn_dp')
     MLP_DATA = 'data'
-    ATTN_HEAD = 'model'
+    ATTN_HEAD = ('model', 'expert')
     ATTN_TENSOR = None
     MLP_TENSOR = ('attn_dp', 'model', 'expert')
     MOE_TENSOR = ('attn_dp', 'model')
     EXPERT = ('attn_dp', 'expert', 'model')
-    VOCAB = ('expert', 'model')
+    EXPERT_DATA = ('data', 'attn_dp', 'expert', 'model')
+    VOCAB = ('attn_dp', 'model', 'expert')
+    MODEL_1 = 'model'
+    MODEL_2 = 'expert'
 
 
 class ShardingAxisName2D:
@@ -44,12 +60,14 @@ class ShardingAxisName2D:
     MLP_TENSOR = 'model'
     MOE_TENSOR = 'model'
     EXPERT = 'model'
+    EXPERT_DATA = ('data', 'model')
     VOCAB = ('data', 'model')
 
 
 try:
-    _use_base_sharding = os.getenv("NEW_MODEL_DESIGN", False)
-    if _use_base_sharding:
+    _use_2d_tp_sharding = envs.USE_2D_TP
+    _use_base_sharding = envs.NEW_MODEL_DESIGN
+    if _use_2d_tp_sharding or _use_base_sharding:
         ShardingAxisName = ShardingAxisNameBase
     else:
         ShardingAxisName = ShardingAxisName2D
@@ -120,10 +138,19 @@ class ShardingConfigManager:
                                                     False)
         if enable_dp_attention:
             # Replicate attention layer when num_kv_heads < TP
-            num_kv_heads = vllm_config.model_config.get_total_num_kv_heads()
+            num_kv_heads = 1 if vllm_config.model_config.use_mla else vllm_config.model_config.get_total_num_kv_heads(
+            )
+            cache_dtype = vllm_config.cache_config.cache_dtype
+            if cache_dtype == 'auto':
+                cache_dtype = vllm_config.model_config.dtype
             kv_dtype = utils.get_jax_dtype_from_str_dtype(
-                vllm_config.cache_config.cache_dtype) or jnp.bfloat16
+                cache_dtype) or jnp.bfloat16
             packing = 4 // jnp.dtype(kv_dtype).itemsize
+
+            # The default head dim is 128 but 64 is also supported as a special case.
+            if vllm_config.model_config.get_head_size() == 64:
+                packing *= 2
+
             # When num_kv_heads * 2 / packing < TP, tensor parallelism would
             # duplicate KV heads across devices, wasting kv cache memory.
             # Use attention DP instead to reduce per-device num_kv_heads and
@@ -166,10 +193,11 @@ class ShardingConfigManager:
                     f"LoRA is not supported with data parallelism "
                     f"(DP size: {total_dp_size}). Please disable LoRA or "
                     f"set data parallelism to 1.")
-            if not os.environ.get("NEW_MODEL_DESIGN", False):
+        if sharding_strategy.attention_data_parallelism > 1:
+            if not envs.NEW_MODEL_DESIGN:
                 raise ValueError(
-                    "Must run DP with NEW_MODEL_DESIGN enabled. Please set the "
-                    "NEW_MODEL_DESIGN=True.")
+                    "Must run Attention DP with NEW_MODEL_DESIGN enabled. Please set "
+                    "NEW_MODEL_DESIGN=True")
 
     @property
     def total_dp_size(self) -> int:

@@ -1,3 +1,17 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from functools import partial
 from unittest.mock import MagicMock, patch
 
@@ -29,10 +43,7 @@ class MockModelConfig:
     def __init__(self, hf_config, dtype):
         self.hf_config = hf_config
         self.dtype = dtype
-        self.multimodal_config = MultiModalConfig(
-            image_input_type="pixel",
-            image_token_id=hf_config.image_token_id,
-            image_input_shape=None)
+        self.multimodal_config = MultiModalConfig()
         self.model = "mock_qwen2_5_vl"
         # Add other attributes if needed by the code
         self.tokenizer = "mock_tokenizer"
@@ -48,6 +59,9 @@ class MockModelConfig:
 
     def get_head_size(self):
         return self.hf_config.hidden_size // self.hf_config.num_attention_heads
+
+    def get_vocab_size(self):
+        return self.hf_config.vocab_size
 
 
 class MockVllmConfig:
@@ -90,6 +104,8 @@ class MockVllmConfig:
         self.device_config = MagicMock(spec=DeviceConfig)
         self.load_config = MagicMock()
         self.extra_configs = {}
+        self.additional_config = {}
+        self.quant_config = None
 
 
 @pytest.fixture(scope="module")
@@ -345,8 +361,14 @@ class TestQwen2_5_VisionTransformer:
         expected_len = window_index_thw.shape[0] * sm * sm
         assert rotary_pos_emb_thw.shape == (expected_len, head_dim_rope)
 
-    def test_call(self, vision_transformer: Qwen2_5_VisionTransformer,
-                  rng: PRNGKey):
+    @pytest.mark.parametrize("enable_dynamic_image_sizes", [False, True])
+    def test_call(self, mock_vllm_config: MockVllmConfig, rngs: nnx.Rngs,
+                  mesh: Mesh, rng: PRNGKey, enable_dynamic_image_sizes: bool):
+        mock_vllm_config.additional_config = {
+            "enable_dynamic_image_sizes": enable_dynamic_image_sizes
+        }
+        vision_transformer = Qwen2_5_VisionTransformer(mock_vllm_config, rngs,
+                                                       mesh)
         # Mock the flash_attention call to avoid sharding errors in test environment
         for block in vision_transformer.blocks:
             # The mock should return a tensor of the same shape as the query 'q'
@@ -354,7 +376,7 @@ class TestQwen2_5_VisionTransformer:
                 side_effect=lambda q, k, v, seg: jnp.ones_like(q))
 
         vc = vision_transformer.config
-        t_pix, h_pix, w_pix = 2, 28, 28
+        t_pix, h_pix, w_pix = 2, 84, 28
 
         # The number of patches is calculated from the pixel dimensions of the image/video
         num_patches = (t_pix // vc.temporal_patch_size) * \
@@ -384,7 +406,7 @@ class TestQwen2_5_VLForConditionalGeneration:
     def model(self, mock_vllm_config: MockVllmConfig, rng: PRNGKey,
               mesh: Mesh):
         with patch('tpu_inference.models.jax.qwen2_5_vl.Qwen2_5_VisionTransformer', autospec=True) as MockVision, \
-             patch('tpu_inference.models.jax.qwen2_5_vl.Qwen2ForCausalLM', autospec=True) as MockLM:
+             patch('tpu_inference.models.jax.qwen2_5_vl.Qwen2Model', autospec=True) as MockLM:
             mock_visual = MockVision.return_value
             mock_visual.dtype = mock_vllm_config.model_config.dtype
             mock_visual.config = mock_vllm_config.model_config.hf_config.vision_config
@@ -394,7 +416,8 @@ class TestQwen2_5_VLForConditionalGeneration:
                                                        mesh)
             # Directly assign mocked instances
             model.visual = mock_visual
-            model.language_model = MockLM.return_value
+            model.model = MockLM.return_value
+            model.compute_logits = MagicMock()
             yield model
 
     def test_validate_and_reshape_mm_tensor(
@@ -470,8 +493,7 @@ class TestQwen2_5_VLForConditionalGeneration:
         assert embeddings[1].shape == (tokens_per_image, vc.out_hidden_size)
         assert model.visual.call_count == 2
 
-    def test_get_multimodal_embeddings(
-            self, model: Qwen2_5_VLForConditionalGeneration):
+    def test_embed_multimodal(self, model: Qwen2_5_VLForConditionalGeneration):
         grid_thw = ((2, 28, 28), )
         vc = model.config.vision_config
         patch_dim = vc.in_channels * vc.temporal_patch_size * vc.patch_size * vc.patch_size
@@ -482,33 +504,32 @@ class TestQwen2_5_VLForConditionalGeneration:
         with patch.object(model,
                           '_process_image_input',
                           return_value=(mock_vision_output, )) as mock_process:
-            mm_embeds = model.get_multimodal_embeddings(
-                grid_thw, pixel_values=pixel_values)
+            mm_embeds = model.embed_multimodal(grid_thw,
+                                               pixel_values=pixel_values)
             mock_process.assert_called_once()
             assert isinstance(mm_embeds, tuple)
             assert len(mm_embeds) == 1
             assert mm_embeds[0].shape == (tokens_per_image, vc.out_hidden_size)
 
-        mm_embeds_none = model.get_multimodal_embeddings(grid_thw)
+        mm_embeds_none = model.embed_multimodal(grid_thw)
         assert len(mm_embeds_none) == 0
 
     @patch('tpu_inference.models.jax.qwen2_5_vl.merge_multimodal_embeddings')
-    def test_get_input_embeddings(self, mock_merge_embeddings: MagicMock,
-                                  model: Qwen2_5_VLForConditionalGeneration,
-                                  rng: PRNGKey):
+    def test_embed_input_ids(self, mock_merge_embeddings: MagicMock,
+                             model: Qwen2_5_VLForConditionalGeneration,
+                             rng: PRNGKey):
         input_ids = jax.random.randint(rng, (1, 10), 0,
                                        model.config.vocab_size)
         mock_text_embeds = jnp.ones((1, 10, model.config.hidden_size))
-        model.language_model.model = MagicMock()
-        model.language_model.model.embed = MagicMock(
-            return_value=mock_text_embeds)
+        model.model = MagicMock()
+        model.model.embed_tokens = MagicMock(return_value=mock_text_embeds)
 
-        embeds = model.get_input_embeddings(input_ids, None)
+        embeds = model.embed_input_ids(input_ids, None)
         np.testing.assert_array_equal(embeds, mock_text_embeds)
         mock_merge_embeddings.assert_not_called()
 
         empty_mm = jnp.ones((0, model.config.hidden_size), )
-        embeds_empty_mm = model.get_input_embeddings(input_ids, empty_mm)
+        embeds_empty_mm = model.embed_input_ids(input_ids, empty_mm)
         np.testing.assert_array_equal(embeds_empty_mm, mock_text_embeds)
         mock_merge_embeddings.assert_not_called()
 
@@ -516,7 +537,7 @@ class TestQwen2_5_VLForConditionalGeneration:
         mock_merged = jnp.ones((1, 15, model.config.hidden_size))
         mock_merge_embeddings.return_value = mock_merged
 
-        embeds_mm = model.get_input_embeddings(input_ids, mm_embeds)
+        embeds_mm = model.embed_input_ids(input_ids, mm_embeds)
         np.testing.assert_array_equal(embeds_mm, mock_merged)
         mock_merge_embeddings.assert_called_once_with(
             input_ids, mock_text_embeds, mm_embeds,
@@ -529,15 +550,14 @@ class TestQwen2_5_VLForConditionalGeneration:
                                        model.config.vocab_size)
         attn_meta = MagicMock(spec=AttentionMetadata)
         mock_lm_output = ([MagicMock()],
-                          jnp.ones((1, 10, model.config.hidden_size)), [])
-        model.language_model.return_value = mock_lm_output
+                          jnp.ones((1, 10, model.config.hidden_size)))
+        model.model.return_value = mock_lm_output
 
         new_kvs, x, aux_hidden_states = model(kv_caches, input_ids, attn_meta)
-        model.language_model.assert_called_once_with(
-            kv_caches=kv_caches,
-            input_ids=input_ids,
-            attention_metadata=attn_meta,
-            inputs_embeds=None)
+        model.model.assert_called_once_with(kv_caches=kv_caches,
+                                            input_ids=input_ids,
+                                            attention_metadata=attn_meta,
+                                            inputs_embeds=None)
         assert len(new_kvs) == 1
         assert x.shape == (1, 10, model.config.hidden_size)
         assert len(aux_hidden_states) == 0
@@ -546,14 +566,13 @@ class TestQwen2_5_VLForConditionalGeneration:
                             rng: PRNGKey):
         hidden_states = jnp.ones((1, 10, model.config.hidden_size))
         mock_logits = jnp.ones((1, 10, model.config.vocab_size))
-        model.language_model.compute_logits.return_value = mock_logits
+        model.compute_logits.return_value = mock_logits
 
         logits = model.compute_logits(hidden_states)
         np.testing.assert_array_equal(logits, mock_logits)
-        model.language_model.compute_logits.assert_called_once_with(
-            hidden_states)
+        model.compute_logits.assert_called_once_with(hidden_states)
 
-    @patch('tpu_inference.models.jax.qwen2_5_vl.load_hf_weights')
+    @patch("tpu_inference.models.jax.utils.weight_utils.load_hf_weights")
     def test_load_weights(self, mock_load_weights: MagicMock,
                           model: Qwen2_5_VLForConditionalGeneration,
                           mock_vllm_config: MockVllmConfig, rng: PRNGKey,
@@ -563,19 +582,16 @@ class TestQwen2_5_VLForConditionalGeneration:
         kwargs = mock_load_weights.call_args.kwargs
         assert kwargs['vllm_config'] == mock_vllm_config
         assert kwargs['model'] is model
-        assert "model.embed_tokens" in kwargs['metadata_map'].name_map
-        assert "lm_head" in kwargs[
-            'metadata_map'].name_map  # Should be present when not tied
         assert kwargs['mesh'] is mesh
         assert isinstance(model.rng, nnx.Rngs)
-        assert model.language_model.rng is model.rng
+        assert model.rng is model.rng
 
-    @patch('tpu_inference.models.jax.qwen2_5_vl.load_hf_weights')
+    @patch("tpu_inference.models.jax.utils.weight_utils.load_hf_weights")
     def test_load_weights_tied(self, mock_load_weights: MagicMock,
                                rng: PRNGKey, mesh: Mesh):
         mock_vllm_config_tied = MockVllmConfig(tie_word_embeddings=True)
         with patch('tpu_inference.models.jax.qwen2_5_vl.Qwen2_5_VisionTransformer', autospec=True), \
-             patch('tpu_inference.models.jax.qwen2_5_vl.Qwen2ForCausalLM', autospec=True):
+             patch('tpu_inference.models.jax.qwen2_5_vl.Qwen2Model', autospec=True):
             model = Qwen2_5_VLForConditionalGeneration(mock_vllm_config_tied,
                                                        rng, mesh)
 

@@ -1,3 +1,17 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import copy
 import functools
 from collections.abc import Sequence
@@ -9,6 +23,7 @@ import jax
 import torch
 import torch.nn
 import torchax
+import vllm.envs as vllm_envs
 from flax.typing import PRNGKey
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from torchax.interop import jax_view, torch_view
@@ -21,9 +36,13 @@ from vllm.model_executor.model_loader import get_model as vllm_get_model
 from vllm.model_executor.models import supports_lora, supports_multimodal
 from vllm.sequence import IntermediateTensors
 
+from tpu_inference.distributed.jax_parallel_state import \
+    get_pp_group as jax_get_pp_group
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
+from tpu_inference.layers.common.sharding import ShardingAxisName
+from tpu_inference.layers.vllm.process_weights.cleanup_sharding import \
+    shard_model_to_tpu
 from tpu_inference.layers.vllm.quantization import get_tpu_quantization_config
-from tpu_inference.layers.vllm.sharding import shard_model_to_tpu
 from tpu_inference.logger import init_logger
 from tpu_inference.models.jax.jax_intermediate_tensor import \
     JaxIntermediateTensors
@@ -83,6 +102,22 @@ class VllmModelWrapper:
 
         self.vllm_config.quant_config = get_tpu_quantization_config(
             self.vllm_config, self.mesh)
+        self._apply_pp_patch()
+
+    def _apply_pp_patch(self):
+        # patch `get_pp_group` in vLLM to jax's get_pp_group.
+        import sys
+
+        import vllm.distributed as vllm_dist
+        import vllm.distributed.parallel_state as vllm_ps
+
+        vllm_ps.get_pp_group = jax_get_pp_group
+        vllm_dist.get_pp_group = jax_get_pp_group
+
+        for module_name, module in sys.modules.items():
+            if module_name.startswith("vllm.model_executor.models"):
+                if hasattr(module, "get_pp_group"):
+                    setattr(module, "get_pp_group", jax_get_pp_group)
 
     def load_weights(self):
         # Set up to load the model into CPU first.
@@ -94,13 +129,14 @@ class VllmModelWrapper:
             slice_config = self.vllm_config.device_config.slice
             modified_slice_config = True
             self.vllm_config.device_config.slice = None
+        self.vllm_config.compilation_config.static_forward_context.clear()
+
         vllm_config_for_load = copy.deepcopy(self.vllm_config)
         if modified_slice_config:
             self.vllm_config.device_config.slice = slice_config
         assert self.vllm_config.model_config.dtype in TORCH_DTYPE_TO_JAX, "The model_config.dtype must be a PyTorch dtype."
         vllm_config_for_load.device_config.device = "cpu"
         # Clearing the cached compilation config, otherwise vllm model init will fail
-        vllm_config_for_load.compilation_config.static_forward_context.clear()
 
         # When expert parallelism is enabled, vLLM loads weight in sharding
         # aware manner. Since tpu-inference has its own sharding logic, this
@@ -120,9 +156,16 @@ class VllmModelWrapper:
             "torch._sync",
             return_value=None) if use_random_weights else nullcontext()
 
+        # By default load weights to the CPU device first. If we are running
+        # under Pathways, this would cause weights to be loaded on a CPU-only
+        # node, so we'll need to remove this context.
+        jax_context = jax.default_device(
+            jax.devices("cpu")
+            [0]) if not vllm_envs.VLLM_TPU_USING_PATHWAYS else nullcontext()
+
         # Load the vLLM model and wrap it into a new model whose forward
         # function can calculate the hidden_state and logits.
-        with load_context:
+        with load_context, jax_context:
             vllm_model = vllm_get_model(vllm_config=vllm_config_for_load)
         lora_manager = None
         if vllm_config_for_load.lora_config is not None:
@@ -152,6 +195,12 @@ class VllmModelWrapper:
         @functools.partial(
             jax.jit,
             donate_argnames=("kv_caches", ),
+            out_shardings=(
+                None,  # kv_caches - keep original sharding
+                NamedSharding(self.mesh,
+                              PartitionSpec(ShardingAxisName.MLP_DATA, None)),
+                None,  # empty list
+            ),
             compiler_options={
                 "xla_tpu_all_gather_collective_matmul_mode":
                 "post_spmd_conservative",
@@ -167,6 +216,7 @@ class VllmModelWrapper:
             input_ids: jax.Array,
             attn_metadata: AttentionMetadata,
             input_embeds: jax.Array,
+            input_positions: jax.Array,
             layer_name_to_kvcache_index: Sequence[Tuple[str, int]],
             lora_metadata,
             intermediate_tensors: JaxIntermediateTensors = None,
@@ -193,7 +243,7 @@ class VllmModelWrapper:
                     torch_view(params_and_buffers),
                     kwargs={
                         "input_ids": torch_view(input_ids),
-                        "positions": torch_view(attn_metadata.input_positions),
+                        "positions": torch_view(input_positions),
                         "intermediate_tensors": intermediate_tensors,
                         "inputs_embeds": None,
                     },
@@ -217,8 +267,10 @@ class VllmModelWrapper:
 
         @functools.partial(
             jax.jit,
-            out_shardings=(NamedSharding(self.mesh,
-                                         PartitionSpec(None, "model"))),
+            out_shardings=(NamedSharding(
+                self.mesh,
+                PartitionSpec(ShardingAxisName.MLP_DATA,
+                              ShardingAxisName.MLP_TENSOR))),
         )
         def compute_logits_func(
             params_and_buffers: Any,
@@ -260,7 +312,6 @@ def load_lora_model(model: torch.nn.Module, vllm_config: VllmConfig,
         vllm_config,
         device,
         model.embedding_modules,
-        model.embedding_padding_modules,
     )
     return lora_manager, lora_manager.create_lora_manager(model)
 
@@ -274,10 +325,9 @@ def replace_set_lora(model):
         index: int,
         lora_a: torch.Tensor,
         lora_b: torch.Tensor,
-        embeddings_tensor: Optional[torch.Tensor],
     ):
         with torchax.default_env():
-            self._original_set_lora(index, lora_a, lora_b, embeddings_tensor)
+            self._original_set_lora(index, lora_a, lora_b)
 
     def _tpu_reset_lora(self, index: int):
         with torchax.default_env():

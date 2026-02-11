@@ -1,3 +1,17 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 from typing import Union
 
 import jax
@@ -29,25 +43,25 @@ def sanity_check_mm_encoder_outputs(
 ) -> None:
     """
     Perform sanity checks for the result of
-    [`vllm.model_executor.models.SupportsMultiModal.get_multimodal_embeddings`][].
+    [`vllm.model_executor.models.SupportsMultiModal.embed_multimodal`][].
     """
     assert isinstance(mm_embeddings, (list, tuple, jax.Array)), (
         "Expected multimodal embeddings to be a list/tuple of 2D tensors, "
         f"or a single 3D tensor, but got {type(mm_embeddings)} "
         "instead. This is most likely due to incorrect implementation "
-        "of the model's `get_multimodal_embeddings` method.")
+        "of the model's `embed_multimodal` method.")
 
     assert len(mm_embeddings) == expected_num_items, (
         "Expected number of multimodal embeddings to match number of "
         f"input items: {expected_num_items}, but got {len(mm_embeddings)=} "
         "instead. This is most likely due to incorrect implementation "
-        "of the model's `get_multimodal_embeddings` method.")
+        "of the model's `embed_multimodal` method.")
 
     assert all(e.ndim == 2 for e in mm_embeddings), (
         "Expected multimodal embeddings to be a sequence of 2D tensors, "
         f"but got tensors with shapes {[e.shape for e in mm_embeddings]} "
         "instead. This is most likely due to incorrect implementation "
-        "of the model's `get_multimodal_embeddings` method.")
+        "of the model's `embed_multimodal` method.")
 
 
 def flatten_embeddings(embeddings: NestedTensors) -> jax.Array:
@@ -115,6 +129,89 @@ def _merge_multimodal_embeddings(
     # Use jnp.where to select between original and new embeddings.
     condition = jnp.expand_dims(is_multimodal, axis=-1)
     return jnp.where(condition, update_values, inputs_embeds)
+
+
+def _to_jax_array(x):
+    """Convert torch.Tensor or numpy array to JAX array."""
+    if x is None:
+        return None
+    if isinstance(x, jax.Array):
+        return x
+    # Handle torch.Tensor - convert via numpy
+    if hasattr(x, 'numpy'):
+        return jnp.array(x.numpy())
+    return jnp.array(x)
+
+
+def scatter_mm_placeholders(
+    embeds: jax.Array,
+    is_embed: Union[jax.Array, "torch.Tensor", None],
+) -> jax.Array:
+    """
+    Scatter the multimodal embeddings into a contiguous tensor that represents
+    the placeholder tokens.
+
+    JAX-compatible version of vllm.v1.worker.utils.scatter_mm_placeholders.
+
+    Args:
+        embeds: Multimodal embeddings of shape (num_embeds, embed_dim)
+        is_embed: Boolean mask of shape (num_placeholders,) indicating which
+            positions should receive embeddings. Can be JAX array or torch.Tensor.
+            If None, returns embeds as-is.
+
+    Returns:
+        Placeholder tensor of shape (num_placeholders, embed_dim) with NaN at
+        non-embedding positions.
+    """
+    if is_embed is None:
+        return embeds
+
+    # Convert inputs to JAX arrays
+    embeds = _to_jax_array(embeds)
+    is_embed = _to_jax_array(is_embed)
+
+    # Create gather indices using cumsum (similar to _merge_multimodal_embeddings)
+    # For True positions: maps to 0, 1, 2, ... (embedding indices)
+    # For False positions: maps to len(embeds) (NaN row)
+    embed_indices = jnp.cumsum(is_embed) - 1
+
+    # Append a NaN row for non-embedding positions
+    nan_row = jnp.full((1, embeds.shape[-1]), jnp.nan, dtype=embeds.dtype)
+    padded_embeds = jnp.concatenate([embeds, nan_row], axis=0)
+
+    # For False positions, point to the NaN row
+    max_idx = embeds.shape[0]
+    gather_indices = jnp.where(is_embed, embed_indices, max_idx)
+
+    return padded_embeds[gather_indices]
+
+
+def gather_mm_placeholders(
+    placeholders: jax.Array,
+    is_embed: Union[jax.Array, "torch.Tensor", None],
+) -> jax.Array:
+    """
+    Reconstructs the embeddings from the placeholder tokens.
+
+    JAX-compatible version of vllm.v1.worker.utils.gather_mm_placeholders.
+
+    Args:
+        placeholders: Placeholder tensor of shape (num_placeholders, embed_dim)
+        is_embed: Boolean mask indicating which positions have embeddings.
+            Can be JAX array or torch.Tensor. If None, returns placeholders as-is.
+
+    Returns:
+        Embeddings extracted from True positions in the mask.
+    """
+    if is_embed is None:
+        return placeholders
+
+    # Convert inputs to JAX arrays
+    placeholders = _to_jax_array(placeholders)
+    is_embed = _to_jax_array(is_embed)
+
+    # Use boolean indexing to extract embeddings
+    return placeholders[is_embed]
 
 
 def merge_multimodal_embeddings(

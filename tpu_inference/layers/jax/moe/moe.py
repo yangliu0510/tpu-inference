@@ -1,4 +1,18 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from dataclasses import InitVar, dataclass
+from typing import Optional
 
 import jax
 import jax.numpy as jnp
@@ -6,10 +20,37 @@ from flax import nnx
 from flax.typing import Sharding
 from jaxtyping import Float
 
+from tpu_inference.layers.common.moe import MoEBackend
+from tpu_inference.layers.jax import JaxModule
 from tpu_inference.layers.jax.base import create_param
 from tpu_inference.layers.jax.layers import FlaxUtils
+from tpu_inference.layers.jax.quantization import QuantizeMethodBase
+from tpu_inference.layers.jax.quantization.configs import QuantizationConfig
 
 modeling_flax_utils = FlaxUtils()
+
+
+@dataclass(kw_only=True)
+class CombineExperts(nnx.Module):
+    """Combines expert outputs with router weights.
+
+    Supports `TED,TE -> TD` when passed expert outputs, using float32
+    accumulation for numerical stability, then casting back to the target
+    dtype.
+    """
+
+    dtype: jnp.dtype
+
+    def __call__(self, expert_outputs_TED: Float, weights_TE: Float) -> Float:
+        with jax.named_scope("combine_experts"):
+            output_TD = jnp.einsum(
+                "TED,TE -> TD",
+                expert_outputs_TED.astype(jnp.float32),
+                weights_TE.astype(jnp.float32),
+                precision="float32",
+            )
+
+        return output_TD.astype(self.dtype)
 
 
 @dataclass(kw_only=True)
@@ -29,6 +70,7 @@ class Router(nnx.Module):
     activation_ffw_td: Sharding
     ed_sharding: Sharding
     random_init: bool = False
+    moe_backend: MoEBackend = MoEBackend.DENSE_MAT
 
     def __call__(self, x_TD: Float):
         """Routes tokens to experts.
@@ -46,14 +88,21 @@ class Router(nnx.Module):
         router_act = modeling_flax_utils.ACT2FN[self.router_act]
         router_logits_TE = jnp.einsum('TD,DE -> TE', x_TD,
                                       self.kernel_DE.value)
-        weights_TX, selected_experts_TX = jax.lax.top_k(
-            router_logits_TE, self.num_experts_per_tok)
-        if self.router_act != "sigmoid":  # sigmoid does not accept axis argument.
-            normalized_weights_TX = router_act(weights_TX.astype(self.dtype),
-                                               axis=-1)
+
+        #TODO: Refactor the Router so that it will always only return router_logits_TE
+        if self.moe_backend in MoEBackend.fused_moe_backends():
+            return router_logits_TE
         else:
-            normalized_weights_TX = router_act(weights_TX.astype(self.dtype))
-        return normalized_weights_TX, selected_experts_TX
+            weights_TX, selected_experts_TX = jax.lax.top_k(
+                router_logits_TE, self.num_experts_per_tok)
+            if self.router_act != "sigmoid":  # sigmoid does not accept axis argument.
+                normalized_weights_TX = router_act(weights_TX.astype(
+                    self.dtype),
+                                                   axis=-1)
+            else:
+                normalized_weights_TX = router_act(
+                    weights_TX.astype(self.dtype))
+            return normalized_weights_TX, selected_experts_TX
 
     def __post_init__(self, rngs: nnx.Rngs):
         """Generates the router kernel (weights) for routing."""
@@ -65,8 +114,9 @@ class Router(nnx.Module):
                                       random_init=self.random_init)
 
 
+# --- Main Class for MoE ---
 @dataclass(kw_only=True)
-class MoE(nnx.Module):
+class JaxMoE(JaxModule):
     """Mixture-of-Experts (MoE) Routed MLP Layer.
 
     This module implements a MoE layer with a router and multiple expert MLPs.
@@ -76,17 +126,39 @@ class MoE(nnx.Module):
     """
     dtype: jnp.dtype
     num_local_experts: int
-    apply_expert_weight_before_computation: bool
     hidden_size: int
     intermediate_size_moe: int
     hidden_act: str
     rngs: InitVar[nnx.Rngs]
     router: nnx.Module
+    mesh: jax.sharding.Mesh
+    # --- Sharding Config ---
     activation_ffw_td: Sharding
     activation_ffw_ted: Sharding
     edf_sharding: Sharding
     efd_sharding: Sharding
+    e2df_sharding: Sharding = ()
+
+    # --- Flags & Configs ---
+    apply_expert_weight_before_computation: bool
+    expert_axis_name: str
+    num_expert_parallelism: int
     random_init: bool = False
+    moe_backend: MoEBackend = MoEBackend.DENSE_MAT
+    scoring_func = "softmax"
+
+    # --- Sparse MoE Specific Attributes ---
+    num_experts_per_tok: int = 1  # Required for Sparse, optional/derived for Dense
+    tile_size: tuple[int, int, int] = (128, 128, 128)
+    # NOTE: this is only needed for SparseMoE
+    qwix_quantized_weight_dtype: Optional[jnp.dtype] = None
+
+    # --- MoE Kernel Specific Attributes ---
+    renormalize: bool = True
+
+    # ---- Quantization Specific Attributes ----
+    quant_config: Optional[QuantizationConfig] = None
+    quant_prefix: str = ""
 
     def __call__(self, x_TD: Float):
         """Performs the forward pass of the MoE layer.
@@ -97,113 +169,53 @@ class MoE(nnx.Module):
         Returns:
             Output array of shape (sequence_length, d_model) after passing through MoE.
         """
-        x_TD = jnp.asarray(x_TD, self.dtype)
-        x_TD = nnx.with_sharding_constraint(x_TD, self.activation_ffw_td)
-        weights_TX, indices_TX = self.router(x_TD)
-        one_hot_indices_TXE = jax.nn.one_hot(
-            indices_TX, num_classes=self.num_local_experts, dtype=self.dtype)
-        full_weights_TE = jnp.sum(one_hot_indices_TXE * weights_TX[..., None],
-                                  axis=1)
-
-        # Some models use the routing scores to weight the data instead of
-        # weighting the expert outputs.
-        if self.apply_expert_weight_before_computation:
-            with jax.named_scope("pre_computing_weight"):
-                return self._moe_fwd_preapply_router_weights(
-                    x_TD, full_weights_TE)
-        else:
-            return self._moe_fwd(x_TD, full_weights_TE)
+        if self.quant_method is not None:
+            return self.quant_method.apply_jax(self, x_TD)
+        raise ValueError("Expected quant_method to be set!")
 
     def __post_init__(self, rngs: nnx.Rngs):
         """Generates the kernels (weights) for the router and experts (gating, up-projection, and down-projection layers)."""
+        self.use_ep = self.num_expert_parallelism > 1
+        if self.quant_config is None:
+            self.quant_method = None
+        elif (quant_method :=
+              self.quant_config.get_quant_method(self,
+                                                 prefix=self.quant_prefix)):
+            assert isinstance(quant_method, QuantizeMethodBase)
+            self.quant_method = quant_method
+            self.quant_method.create_weights_jax(self)
+        else:
+            self.quant_method = None
 
+        E = self.num_local_experts
         D = self.hidden_size
         F = self.intermediate_size_moe
-        shape_gating = (self.num_local_experts, D, F)
-        shape_up = (self.num_local_experts, D, F)
-        shape_down = (self.num_local_experts, F, D)
 
         self.kernel_gating_EDF = create_param(rngs,
-                                              shape=shape_gating,
+                                              shape=(E, D, F),
                                               dtype=self.dtype,
                                               sharding=self.edf_sharding,
                                               random_init=self.random_init)
         self.kernel_up_proj_EDF = create_param(rngs,
-                                               shape=shape_up,
+                                               shape=(E, D, F),
                                                dtype=self.dtype,
                                                sharding=self.edf_sharding,
                                                random_init=self.random_init)
-        self.kernel_down_proj_EFD = create_param(rngs,
-                                                 shape=shape_down,
-                                                 dtype=self.dtype,
-                                                 sharding=self.efd_sharding,
-                                                 random_init=self.random_init)
+        self.kernel_down_proj_EFD = create_param(
+            rngs,
+            shape=(E, F, D),
+            dtype=self.dtype,
+            sharding=self.efd_sharding if self.moe_backend
+            not in MoEBackend.fused_moe_backends() else self.edf_sharding,
+            random_init=self.random_init)
 
-    def _moe_fwd_preapply_router_weights(self, x_TD: jax.Array, weights_TE):
-        """Performs the forward pass of the MoE experts with router weights pre-applied to the inputs.
+        # Derive if data is sharded by expert
+        self.data_axis_name = self.activation_ffw_td[0]
+        self.is_batch_sharded_by_expert = (
+            self.expert_axis_name is not None) and (self.expert_axis_name
+                                                    == self.data_axis_name)
 
-        Args:
-            x_TD: Input array for the experts, shape (sequence_length, hidden_size).
-            weights_TE: Router weights, shape (sequence_length, num_experts).
-
-        Returns:
-            Output array of shape (sequence_length, d_model).
-        """
-        # Data needs to be replicated since it will be weighted by the router
-        # scores before being passed to each expert.
-        num_experts = weights_TE.shape[-1]
-        x_TED = jnp.repeat(x_TD[:, None, :], num_experts, 1)
-        weights_TED = weights_TE[..., None]
-        x_TED = jnp.asarray(x_TED, self.dtype)
-
-        with jax.named_scope("activation_expert_weighting"):
-            x_TED = x_TED * weights_TED
-
-        x_TED = nnx.with_sharding_constraint(x_TED, self.activation_ffw_ted)
-        with jax.named_scope("gating"):
-            gating_TEF = jnp.einsum('TED,EDF -> TEF', x_TED,
-                                    self.kernel_gating_EDF.value)
-            activated_gating_TEF = modeling_flax_utils.ACT2FN[self.hidden_act](
-                gating_TEF)
-        with jax.named_scope("up_projection"):
-            up_proj_TEF = jnp.einsum('TED,EDF -> TEF', x_TED,
-                                     self.kernel_up_proj_EDF.value)
-
-        fuse_TEF = activated_gating_TEF * up_proj_TEF
-
-        with jax.named_scope("down_projection"):
-            down_proj_TED = jnp.einsum('TEF,EFD -> TED', fuse_TEF,
-                                       self.kernel_down_proj_EFD.value)
-        with jax.named_scope("sum"):
-            output_TD = down_proj_TED.sum(axis=1)
-        return output_TD.astype(self.dtype)
-
-    def _moe_fwd(self, x_TD: Float, weights):
-        """Performs the basic forward pass of the MoE experts without dropping or megablocks.
-
-        Args:
-            x_TD: Input array for the experts, shape (sequence_length, d_model).
-            weights: Weights for combining expert outputs, shape (sequence_length, num_experts).
-
-        Returns:
-            Output array of shape (sequence_length, d_model).
-        """
-        x_TD = jnp.asarray(x_TD, self.dtype)
-        x_TD = nnx.with_sharding_constraint(x_TD, self.activation_ffw_td)
-        with jax.named_scope("gating"):
-            gating_TEF = jnp.einsum('TD,EDF -> TEF', x_TD,
-                                    self.kernel_gating_EDF.value)
-            activated_gating_TEF = modeling_flax_utils.ACT2FN[self.hidden_act](
-                gating_TEF)
-        with jax.named_scope("up_projection"):
-            up_proj_TEF = jnp.einsum('TD,EDF -> TEF', x_TD,
-                                     self.kernel_up_proj_EDF.value)
-
-        fuse_TEF = activated_gating_TEF * up_proj_TEF
-
-        with jax.named_scope("down_projection"):
-            down_proj_TED = jnp.einsum('TEF,EFD -> TED', fuse_TEF,
-                                       self.kernel_down_proj_EFD.value)
-        with jax.named_scope("sum"):
-            output_TD = jnp.einsum('TED,TE -> TD', down_proj_TED, weights)
-        return output_TD.astype(self.dtype)
+        self.top_k = self.router.num_experts_per_tok
+        self.use_ep = self.num_expert_parallelism > 1
+        self.activation = self.hidden_act
+        self.scoring_func = self.scoring_func
