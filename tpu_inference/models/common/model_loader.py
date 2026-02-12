@@ -235,6 +235,9 @@ def _get_nnx_model(
                 del vllm_config.model_config.runai_model_weights_iterator
             else:
                 model.load_weights(rng)
+            # Initialize RoPE and other caches after weights are loaded but before JIT compilation
+            if hasattr(model, 'initialize_cache'):
+                model.initialize_cache()
             jit_model = create_jit_model(
                 model,
                 use_qwix_on_abstract_model=should_apply_qwix_on_abstract_model)

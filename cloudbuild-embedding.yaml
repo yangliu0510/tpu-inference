@@ -1,0 +1,15 @@
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '--tag=gcr.io/meta-tpu-rbbq5/qwen3-tpu-inf:v7x'
+      - '--build-arg=VLLM_COMMIT_HASH=1363e3d6d5659b58376fa5284afc2c8be548cc9d'
+      - '--build-arg=IS_FOR_V7X=true'
+      - '--file=docker/Dockerfile'
+      - '.'
+images:
+  - 'gcr.io/meta-tpu-rbbq5/qwen3-tpu-inf:v7x'
+timeout: 3600s
+options:
+  machineType: 'E2_HIGHCPU_32'
+  diskSizeGb: 200
