@@ -32,7 +32,7 @@ from tpu_inference.layers.jax import JaxModule
 from tpu_inference.layers.jax.quantization import get_tpu_quantization_config
 from tpu_inference.logger import init_logger
 from tpu_inference.models.jax.adapters import as_embedding_model
-from tpu_inference.models.jax.utils.quantization.quantization_utils import (
+from tpu_inference.models.jax.utils.qwix.qwix_utils import (
     apply_qwix_on_abstract_model, apply_qwix_quantization,
     load_random_weights_into_qwix_abstract_model,
     update_vllm_config_for_qwix_quantization)
