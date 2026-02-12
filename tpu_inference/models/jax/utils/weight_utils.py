@@ -475,11 +475,11 @@ def _load_hf_weights_on_thread(
                     break
 
         # Converting to config's dtype
-        if not keep_original_dtype and hf_weight.dtype != model_config.dtype:
+        if not keep_original_dtype and hf_weight.dtype != vllm_config.model_config.dtype:
             logger.warning(
-                f"Converting dtype for {hf_key} from {hf_weight.dtype} to {model_config.dtype}"
+                f"Converting dtype for {hf_key} from {hf_weight.dtype} to {vllm_config.model_config.dtype}"
             )
-            hf_weight = hf_weight.astype(model_config.dtype)
+            hf_weight = hf_weight.astype(vllm_config.model_config.dtype)
 
         if hf_key.endswith(".weight"):
             hf_key = hf_key.removesuffix(".weight")
