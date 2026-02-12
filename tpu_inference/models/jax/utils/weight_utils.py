@@ -463,6 +463,13 @@ def _load_hf_weights_on_thread(
     except TypeError:
         shardings = params
 
+    # Extract metadata maps
+    name_map = metadata_map.name_map
+    reshape_keys = metadata_map.reshape_map
+    bias_reshape_keys = metadata_map.bias_reshape_map
+    transpose_keys = metadata_map.transpose_map
+    pad_keys = metadata_map.pad_map
+
     for hf_key, hf_weight in model_weights_single_file_generator(
             weights_file, framework="flax", filter_regex=filter_regex):
 
