@@ -1508,6 +1508,14 @@ class Qwen3VLModel(nnx.Module):
             )
 
         self.tie_word_embeddings = hf_config.tie_word_embeddings
+        self.mesh = mesh
+
+    def initialize_cache(self):
+        """Initialize RoPE caches after weights are loaded and before JIT compilation."""
+        for layer in self.layers:
+            if hasattr(layer, 'self_attn') and hasattr(layer.self_attn, 'rope'):
+                if hasattr(layer.self_attn.rope, 'initialize_cache'):
+                    layer.self_attn.rope.initialize_cache(self.mesh)
 
     def _inject_visual_features(
         self,
@@ -1619,6 +1627,12 @@ class Qwen3VLForConditionalGeneration(nnx.Module):
         self.video_token_id = config.video_token_id
         self.vision_start_token_id = getattr(config, "vision_start_token_id", 151652)
         self.spatial_merge_size = config.vision_config.spatial_merge_size
+
+    def initialize_cache(self):
+        """Initialize RoPE caches after weights are loaded and before JIT compilation."""
+        # Initialize language model RoPE caches
+        if hasattr(self.language_model, 'initialize_cache'):
+            self.language_model.initialize_cache()
 
     def get_input_embeddings(
         self,
