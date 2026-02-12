@@ -24,6 +24,7 @@ import jax
 import jax.numpy as jnp
 import jaxtyping
 import numpy as np
+import torch
 import vllm.envs as vllm_envs
 from flax import nnx
 from jax.experimental import mesh_utils
