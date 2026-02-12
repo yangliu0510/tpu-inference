@@ -1076,7 +1076,7 @@ class Qwen3VLVisionTransformer(nnx.Module):
         model_config = vllm_config.model_config
         hf_config = model_config.hf_config
         vision_config = hf_config.vision_config
-        dtype = model_config.dtype
+        dtype = utils.to_jax_dtype(model_config.dtype)
 
         self.config = vision_config
         self.dtype = dtype
